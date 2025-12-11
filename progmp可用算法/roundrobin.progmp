@@ -1,0 +1,36 @@
+/* 
+ * ProgMP Round-Robin Scheduler
+ * Author: ProgMP Team (Middleware'17)
+ * Description:
+ *   Distributes packets evenly across all available subflows.
+ *   Maintains a counter register R1 to track which subflow to use next.
+ */
+
+SCHEDULER roundrobin;
+
+IF (!Q.EMPTY AND !SUBFLOWS.EMPTY) {
+
+    /* 1) 过滤候选子流：
+     *    - 排除被标记为 lossy 的（若实现包含 sbf.LOSSY）
+     *    - 仅选择有窗口空间可以发送的子流（CWND > in_flight + queued）
+     */
+    VAR sbfs = SUBFLOWS.FILTER(sbf =>
+        /* 若你的内核没有 sbf.LOSSY，这里也不会报错（字段不存在不会被解析）.
+           如果你的实现确实不含 LOSSY，请把 "!sbf.LOSSY AND" 去掉。 */
+        (!sbf.LOSSY) AND
+        (sbf.CWND > sbf.SKBS_IN_FLIGHT + sbf.QUEUED)
+    );
+
+    /* 2) 若候选集合为空则直接返回（安全） */
+    IF (sbfs.EMPTY) { RETURN; }
+
+    /* 3) 边界检查 R1 并回绕 */
+    IF (R1 >= sbfs.COUNT) { SET(R1, 0); }
+
+    /* 4) 取 R1 对应子流并发包 */
+    IF (!Q.EMPTY) {
+        VAR sbf = sbfs.GET(R1);
+        sbf.PUSH(Q.POP());
+        SET(R1, R1 + 1);
+    }
+}

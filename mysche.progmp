@@ -1,0 +1,84 @@
+/*
+ * mysche.progmp - 自定义 MPTCP 调度算法
+ *
+ * 修复说明:
+ * - BW 字段不支持，使用 (CWND * 1000 / (RTT + 1)) 估算带宽。
+ *   注意: RTT 可能为 0，所以加 1 防止除零。CWND 单位通常是 MSS，RTT 是 ms/us，这里主要用于比较大小，单位不统一无妨。
+ * - 移除了 SET(best_sbf, ...) 操作，因为 ProgMP DSL 中局部变量一旦定义不可修改。
+ * - 将逻辑拆分为两个独立的 IF 块，分别定义局部变量 best_sbf 并执行发送。
+ * - 使用不可变变量风格。
+ */
+
+SCHEDULER mysche;
+
+/* 1. 全局过滤：获取所有有效子流 */
+VAR candidates = SUBFLOWS.FILTER(sbf => !sbf.LOSSY AND !sbf.THROTTLED);
+
+IF (candidates.EMPTY) {
+    RETURN;
+}
+
+/* ------------------------------------------------------ */
+/* 模式 0: 延迟优先 (Top-N RTT)                           */
+/* ------------------------------------------------------ */
+IF (R4 == 0) {
+    /* 筛选逻辑: 选出 RTT 排名在 R1 之内的子流 */
+    VAR topN_sbfs = candidates.FILTER(sbf => 
+        candidates.FILTER(other => other.RTT < sbf.RTT).COUNT < R1
+    );
+    
+    /* 发送逻辑: 在筛选出的集合中，找 CWND 有空余且 RTT 最小的 */
+    VAR best_sbf_0 = topN_sbfs
+        .FILTER(sbf => sbf.CWND > sbf.SKBS_IN_FLIGHT + sbf.QUEUED)
+        .MIN(sbf => sbf.RTT);
+        
+    IF (best_sbf_0 != NULL) {
+        /* 重传优先 */
+        IF (!RQ.EMPTY) {
+             IF (best_sbf_0.HAS_WINDOW_FOR(RQ.TOP) AND !RQ.TOP.SENT_ON(best_sbf_0)) {
+                 best_sbf_0.PUSH(RQ.POP());
+                 RETURN;
+             }
+        }
+        /* 新数据 */
+        IF (!Q.EMPTY) {
+             best_sbf_0.PUSH(Q.POP());
+             RETURN;
+        }
+    }
+}
+
+/* ------------------------------------------------------ */
+/* 模式 1: 带宽约束优先 (Bandwidth Constraint)             */
+/* ------------------------------------------------------ */
+IF (R4 == 1) {
+    /* 筛选逻辑: 贪心选择带宽大的，直到累积带宽 > R2 (b1) */
+    /* 使用 CWND/RTT 估算带宽。为避免浮点运算和除零，使用 (CWND * 1000000) / (RTT + 1) */
+    /* RTT 单位通常是 us 或 ms。只要公式一致，相对大小关系不变 */
+    
+    VAR bw_sbfs = candidates.FILTER(sbf => 
+        candidates
+            .FILTER(other => (other.CWND * 1000000 / (other.RTT + 1)) > (sbf.CWND * 1000000 / (sbf.RTT + 1)))
+            .SUM(o => (o.CWND * 1000000 / (o.RTT + 1))) < R2
+    );
+    
+    /* 发送逻辑: 同样是 MinRTT */
+    VAR best_sbf_1 = bw_sbfs
+        .FILTER(sbf => sbf.CWND > sbf.SKBS_IN_FLIGHT + sbf.QUEUED)
+        .MIN(sbf => sbf.RTT);
+        
+    IF (best_sbf_1 != NULL) {
+        /* 重传优先 */
+        IF (!RQ.EMPTY) {
+             IF (best_sbf_1.HAS_WINDOW_FOR(RQ.TOP) AND !RQ.TOP.SENT_ON(best_sbf_1)) {
+                 best_sbf_1.PUSH(RQ.POP());
+                 RETURN;
+             }
+        }
+        /* 新数据 */
+        IF (!Q.EMPTY) {
+             best_sbf_1.PUSH(Q.POP());
+             RETURN;
+        }
+    }
+}
